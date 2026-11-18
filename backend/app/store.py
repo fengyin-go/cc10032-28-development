@@ -89,6 +89,73 @@ class Store:
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
         self._failures: dict[str, FailureRecovery] = {}
+        # ---- 序号28：状态版本与修复台账 ----
+        # 状态版本：version_id → 版本记录（含压缩清单、回滚快照）
+        self._state_versions: dict[str, dict[str, Any]] = {}
+        self._version_seq: int = 0
+        # 压缩并发锁：config_name → 正在执行的幂等键
+        self._compaction_locks: dict[str, str] = {}
+        # 修复台账：序号28 全链路动作记录，供各模块同步核对
+        self._fix_ledger: list[dict[str, Any]] = []
+        self._ledger_seq: int = 0
+
+    # ---- 序号28：状态版本 ----
+
+    def next_state_version_id(self) -> str:
+        """生成单调递增的状态版本号。"""
+        self._version_seq += 1
+        return f"sv-{self._version_seq:04d}"
+
+    def current_state_version(self, config_name: str) -> dict[str, Any] | None:
+        """返回指定状态配置当前生效的版本（页面上最终只确定一个当前版本）。"""
+        current = [
+            v for v in self._state_versions.values()
+            if v.get("config_name") == config_name and v.get("status") == "current"
+        ]
+        if not current:
+            return None
+        current.sort(key=lambda v: v.get("seq", 0))
+        return current[-1]
+
+    def state_versions_for(self, config_name: str | None = None) -> list[dict[str, Any]]:
+        """按序号升序列出版本，可选按配置过滤。"""
+        versions = list(self._state_versions.values())
+        if config_name:
+            versions = [v for v in versions if v.get("config_name") == config_name]
+        return sorted(versions, key=lambda v: v.get("seq", 0))
+
+    # ---- 序号28：修复台账 ----
+
+    def append_fix_ledger(
+        self,
+        action: str,
+        module: str,
+        summary: str,
+        version_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """写入一条修复台账，并返回台账条目。"""
+        self._ledger_seq += 1
+        entry = {
+            "ledger_id": f"led-{self._ledger_seq:04d}",
+            "ticket": "序号28",
+            "action": action,
+            "module": module,
+            "version_id": version_id,
+            "summary": summary,
+            "detail": detail or {},
+            "synced_modules": [module],
+            "ts": time.time(),
+        }
+        self._fix_ledger.append(entry)
+        return entry
+
+    def sync_ledger_modules(self, version_id: str, module: str) -> None:
+        """其他模块消费同一版本后同步台账（其他模块同步更新修复台账）。"""
+        for entry in self._fix_ledger:
+            if entry.get("version_id") == version_id:
+                if module not in entry["synced_modules"]:
+                    entry["synced_modules"].append(module)
 
     # ---- 跨模块数据通道 ----
 

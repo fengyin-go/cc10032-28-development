@@ -2,6 +2,9 @@
 
 数据流角色: replay_engine → checkpoint_mgr（消费者+生产者）→ restore_plan（消费者）
 增强能力: 检查点创建/快照/恢复/对齐、状态校验、外部化存储路径管理、多检查点一致性验证
+
+序号28修复：检查点模块读取状态压缩清单生成快照，
+快照与压缩后的状态键属于同一版本，恢复过程只能使用活动键集合。
 """
 from __future__ import annotations
 
@@ -22,6 +25,122 @@ class CheckpointMgrService(BaseModuleService):
     STATUS_ORDER = ["草稿", "已启用", "已停用"]
     ACTION_RULES = {"启用检查点": "草稿", "停用检查点": "已启用"}
     NEGATIVE_ACTIONS = ["停用检查点"]
+
+    # ---- 序号28：读取状态压缩清单生成快照 ----
+
+    def create_checkpoint_from_manifest(self, config_name: str) -> dict[str, Any]:
+        """读取状态压缩清单生成检查点快照。
+
+        快照只包含当前版本的活动键集合，且与压缩版本号一致：
+        压缩后的状态键和检查点必须属于同一版本。
+        """
+        version = store.current_state_version(config_name)
+        if version is None:
+            return {
+                "ok": False,
+                "error": f"配置「{config_name}」没有当前状态版本，请先执行压缩",
+            }
+
+        # 依据压缩清单收集活动键集合（恢复过程只能使用活动键集合）
+        operator_states: dict[str, Any] = {}
+        referenced_keys: list[str] = []
+        for group in version["manifest"].get("groups", []):
+            if group.get("deferred"):
+                continue
+            active_keys = [str(k) for k in group.get("active_keys", [])]
+            if not active_keys:
+                continue
+            referenced_keys.extend(active_keys)
+            operator_states[group["key_pattern"]] = {
+                "state_keys": active_keys,
+                "active_state_id": group.get("active_state_id"),
+                "version_id": version["version_id"],
+            }
+
+        cp_id = hashlib.md5(
+            f"{config_name}_{version['version_id']}_{time.time()}".encode()
+        ).hexdigest()[:12]
+        int_id = max(
+            (int(r.get("id", 0)) for r in store.rows(self.MODULE)
+             if str(r.get("id", "")).isdigit()),
+            default=0,
+        ) + 1
+
+        snapshot = {
+            "id": int_id,
+            "配置名称": config_name,
+            "间隔时间": "30",
+            "超时时长": "60",
+            "最大并发": "3",
+            "对齐策略": "exactly_once",
+            "保留数量": 5,
+            "外部化路径": "/data/checkpoints",
+            "status": "已启用",
+            "pending": False,
+            "abnormal": False,
+            "checkpoint_id": cp_id,
+            "operator_states": operator_states,
+            "snapshot_ts": time.time(),
+            "_created_at": time.time(),
+            # 序号28：快照与压缩状态键同属一个版本
+            "state_version": version["version_id"],
+            "key_count": len(referenced_keys),
+            "_referenced_state_keys": referenced_keys,
+            "_state_config": config_name,
+        }
+        store.rows(self.MODULE).append(snapshot)
+
+        # 其他模块同步更新修复台账
+        store.append_fix_ledger(
+            action="checkpoint",
+            module=self.MODULE,
+            version_id=version["version_id"],
+            summary=(
+                f"检查点 {cp_id} 依据压缩清单生成快照，"
+                f"活动键 {len(referenced_keys)} 个"
+            ),
+            detail={"checkpoint_id": cp_id, "key_count": len(referenced_keys)},
+        )
+        store.sync_ledger_modules(version["version_id"], self.MODULE)
+
+        return {
+            "ok": True,
+            "checkpoint_id": cp_id,
+            "config": config_name,
+            "state_version": version["version_id"],
+            "key_count": len(referenced_keys),
+            "operators": list(operator_states.keys()),
+        }
+
+    def list_checkpoints_with_version(
+        self, config_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """列出检查点及版本信息，供详情面板核对压缩前后的键数量。"""
+        result = []
+        for r in store.rows(self.MODULE):
+            if not r.get("checkpoint_id"):
+                continue
+            if config_name and r.get("配置名称") != config_name:
+                continue
+            version_id = r.get("state_version")
+            version = store._state_versions.get(version_id) if version_id else None
+            current = store.current_state_version(r.get("配置名称", ""))
+            result.append({
+                "checkpoint_id": r.get("checkpoint_id"),
+                "config": r.get("配置名称", ""),
+                "state_version": version_id,
+                "key_count": r.get("key_count")
+                    if r.get("key_count") is not None
+                    else len(r.get("operator_states", {})),
+                "is_current_version": bool(
+                    current and version_id == current.get("version_id")
+                ),
+                "version_status": version.get("status") if version else None,
+                "snapshot_ts": r.get("snapshot_ts", r.get("timestamp", 0)),
+                "status": r.get("status", ""),
+            })
+        result.sort(key=lambda x: x["snapshot_ts"])
+        return result
 
     # ---- 跨模块数据管理 ----
 
